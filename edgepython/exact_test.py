@@ -125,19 +125,9 @@ def exact_test(y, pair=None, dispersion='auto', rejection_region='doubletail',
     elif len(pair) != 2:
         raise ValueError("pair must be of length 2.")
 
+    pair = [str(p) for p in pair]
     group = np.array([str(g) for g in group])
     unique_group_labels = np.array([str(g) for g in unique_groups])
-
-    # edgeR-style convenience: allow pair as integer level indices (e.g. [0, 1]).
-    if len(pair) == 2 and all(isinstance(p, (int, np.integer)) for p in pair):
-        p0, p1 = int(pair[0]), int(pair[1])
-        if p0 < 0 or p1 < 0 or p0 >= len(unique_group_labels) or p1 >= len(unique_group_labels):
-            raise ValueError(
-                f"pair indices out of range for {len(unique_group_labels)} groups: {pair}"
-            )
-        pair = [unique_group_labels[p0], unique_group_labels[p1]]
-    else:
-        pair = [str(p) for p in pair]
 
     # Get dispersion
     if dispersion is None or dispersion == 'auto':
