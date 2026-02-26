@@ -156,6 +156,51 @@ class TestEstimateDisp:
             val = np.median(np.atleast_1d(prior_df))
             assert abs(val - 2.1818) < 0.05
 
+    def test_estimate_disp_fast_large_lfc(self):
+        rng = np.random.default_rng(123)
+        n_genes = 200
+        n_reps = 3
+        group = np.array(["A"] * n_reps + ["B"] * n_reps)
+        samples = pd.DataFrame({"group": group})
+
+        base = rng.lognormal(mean=1.0, sigma=0.6, size=n_genes)
+        lfc_true = np.zeros(n_genes)
+        lfc_true[:20] = 2.0  # strong effect genes (4x)
+
+        mu = np.outer(base, np.ones(group.size))
+        mu[:, group == "B"] *= (2.0 ** lfc_true)[:, None]
+
+        lib_size = rng.lognormal(mean=12.0, sigma=0.3, size=group.size)
+        mu *= lib_size / np.mean(lib_size)
+
+        disp = 0.1
+        n = 1.0 / disp
+        p = n / (n + mu)
+        counts = rng.negative_binomial(n, p, size=mu.shape).astype(np.float64)
+
+        dge = ep.make_dgelist(counts, samples=samples, group=group)
+        dge = ep.calc_norm_factors(dge)
+
+        design = ep.model_matrix("~ 0 + group", samples)
+        contrast = np.array([-1.0, 1.0])
+
+        d_base = ep.estimate_disp(dge, design=design)
+        fit_base = ep.glm_ql_fit(d_base, design=design)
+        res_base = ep.glm_ql_ftest(fit_base, contrast=contrast)
+
+        d_fast = ep.estimate_disp(dge, design=design, fast=True)
+        fit_fast = ep.glm_ql_fit(d_fast, design=design)
+        res_fast = ep.glm_ql_ftest(fit_fast, contrast=contrast)
+
+        logfc_base = res_base["table"]["logFC"].values
+        logfc_fast = res_fast["table"]["logFC"].values
+
+        idx = np.arange(20)
+        diff = np.abs(logfc_base[idx] - logfc_fast[idx])
+
+        assert np.median(diff) < 0.2
+        assert np.all(np.sign(logfc_base[idx]) == np.sign(logfc_fast[idx]))
+
 
 # ── glmQLFit (dispersion aspects) ──────────────────────────────────
 

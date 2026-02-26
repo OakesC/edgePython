@@ -29,7 +29,8 @@ def estimate_disp(y, design=None, group=None, lib_size=None, offset=None,
                   prior_df=None, trend_method='locfit', tagwise=True,
                   span=None, legacy_span=False, min_row_sum=5,
                   grid_length=21, grid_range=(-10, 10), robust=False,
-                  winsor_tail_p=(0.05, 0.1), tol=1e-6, weights=None):
+                  winsor_tail_p=(0.05, 0.1), tol=1e-6, weights=None,
+                  fast=False):
     """Estimate common, trended and tagwise dispersions.
 
     Port of edgeR's estimateDisp.
@@ -74,11 +75,28 @@ def estimate_disp(y, design=None, group=None, lib_size=None, offset=None,
     weights : ndarray, optional
         Observation weights.
 
+    fast : bool or str
+        If True, use a faster, more approximate dispersion estimation:
+        disables trend fitting, skips tagwise estimation, reduces the
+        dispersion grid, and raises the minimum row sum filter.
+        If 'aggressive', use stronger approximations (smaller grid and
+        higher min_row_sum).
+
     Returns
     -------
     DGEList (if input is DGEList) or dict with common.dispersion,
     trended.dispersion, tagwise.dispersion, span, prior.df, prior.n.
     """
+    # Fast-path overrides for speed (approximate)
+    if fast:
+        trend_method = 'none'
+        tagwise = False
+        grid_length = min(grid_length, 11)
+        min_row_sum = max(min_row_sum, 10)
+        if isinstance(fast, str) and fast.lower() == 'aggressive':
+            grid_length = min(grid_length, 7)
+            min_row_sum = max(min_row_sum, 20)
+
     # Resolve formula string to design matrix
     from .utils import _resolve_design
     design = _resolve_design(design, y)
@@ -103,7 +121,7 @@ def estimate_disp(y, design=None, group=None, lib_size=None, offset=None,
             legacy_span=legacy_span, min_row_sum=min_row_sum,
             grid_length=grid_length, grid_range=grid_range,
             robust=robust, winsor_tail_p=winsor_tail_p, tol=tol,
-            weights=dge.get('weights'))
+            weights=dge.get('weights'), fast=fast)
 
         dge['common.dispersion'] = d['common.dispersion']
         dge['trended.dispersion'] = d['trended.dispersion']
