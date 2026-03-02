@@ -151,7 +151,7 @@ def estimate_disp(y, design=None, group=None, lib_size=None, offset=None,
     # Check group
     if group is None:
         group = np.ones(nlibs, dtype=int)
-    group = drop_empty_levels(np.asarray(group))
+    group = np.asarray(drop_empty_levels(np.asarray(group)))
 
     # Check lib_size
     if lib_size is None:
