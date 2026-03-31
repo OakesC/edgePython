@@ -94,78 +94,78 @@ def mglm_levenberg(y, design, dispersion=0, offset=0, weights=None,
     for it in range(maxit):
         if not np.any(active):
             break
+        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+            a = active
+            n_a = np.count_nonzero(a)
 
-        a = active
-        n_a = np.count_nonzero(a)
+            # Compute mu for active genes: eta = design @ beta + offset
+            # beta[a] is (n_a, ncoefs), design is (nlibs, ncoefs)
+            # eta[g, j] = sum_k(design[j,k] * beta[g,k]) + offset[g,j]
+            eta_a = beta[a] @ design.T + offset_mat[a]
+            mu_a = np.exp(np.clip(eta_a, -500, 500))
+            mu_a = np.maximum(mu_a, 1e-300)
 
-        # Compute mu for active genes: eta = design @ beta + offset
-        # beta[a] is (n_a, ncoefs), design is (nlibs, ncoefs)
-        # eta[g, j] = sum_k(design[j,k] * beta[g,k]) + offset[g,j]
-        eta_a = beta[a] @ design.T + offset_mat[a]
-        mu_a = np.exp(np.clip(eta_a, -500, 500))
-        mu_a = np.maximum(mu_a, 1e-300)
+            # Working weights: w * mu / (1 + disp * mu)
+            denom_a = 1.0 + disp_mat[a] * mu_a
+            working_w_a = w_mat[a] * mu_a / denom_a
+            working_w_a = np.maximum(working_w_a, 1e-300)
 
-        # Working weights: w * mu / (1 + disp * mu)
-        denom_a = 1.0 + disp_mat[a] * mu_a
-        working_w_a = w_mat[a] * mu_a / denom_a
-        working_w_a = np.maximum(working_w_a, 1e-300)
+            # Working residuals
+            z_a = (y[a] - mu_a) / mu_a
 
-        # Working residuals
-        z_a = (y[a] - mu_a) / mu_a
+            # Batch XtWX: (n_a, ncoefs, ncoefs)
+            # XtWX[g,k,l] = sum_j(design[j,k] * working_w[g,j] * design[j,l])
+            XtWX = np.einsum('gj,jk,jl->gkl', working_w_a, design, design)
 
-        # Batch XtWX: (n_a, ncoefs, ncoefs)
-        # XtWX[g,k,l] = sum_j(design[j,k] * working_w[g,j] * design[j,l])
-        XtWX = np.einsum('gj,jk,jl->gkl', working_w_a, design, design)
+            # Batch XtWz: (n_a, ncoefs)
+            # XtWz[g,k] = sum_j(design[j,k] * working_w[g,j] * z[g,j])
+            XtWz = np.einsum('jk,gj->gk', design, working_w_a * z_a)
 
-        # Batch XtWz: (n_a, ncoefs)
-        # XtWz[g,k] = sum_j(design[j,k] * working_w[g,j] * z[g,j])
-        XtWz = np.einsum('jk,gj->gk', design, working_w_a * z_a)
+            # Add per-gene Levenberg damping to diagonal
+            diag_vals = np.diagonal(XtWX, axis1=1, axis2=2)
+            XtWX_lev = XtWX.copy()
+            XtWX_lev[:, coef_idx, coef_idx] += lev[a, np.newaxis] * (diag_vals + 1e-10)
 
-        # Add per-gene Levenberg damping to diagonal
-        diag_vals = np.diagonal(XtWX, axis1=1, axis2=2)
-        XtWX_lev = XtWX.copy()
-        XtWX_lev[:, coef_idx, coef_idx] += lev[a, np.newaxis] * (diag_vals + 1e-10)
+            # Batch solve: (n_a, ncoefs)
+            delta = np.linalg.solve(XtWX_lev, XtWz[..., np.newaxis])[..., 0]
 
-        # Batch solve: (n_a, ncoefs)
-        delta = np.linalg.solve(XtWX_lev, XtWz)
+            # Deviance before update (inline, NOT using _unit_deviance_sum)
+            ud_old = _unit_nb_deviance(y[a], mu_a, disp_mat[a])
+            dev_old = np.sum(w_mat[a] * ud_old, axis=1)
 
-        # Deviance before update (inline, NOT using _unit_deviance_sum)
-        ud_old = _unit_nb_deviance(y[a], mu_a, disp_mat[a])
-        dev_old = np.sum(w_mat[a] * ud_old, axis=1)
+            # Trial update
+            beta_new_a = beta[a] + delta
+            eta_new_a = beta_new_a @ design.T + offset_mat[a]
+            mu_new_a = np.exp(np.clip(eta_new_a, -500, 500))
+            mu_new_a = np.maximum(mu_new_a, 1e-300)
 
-        # Trial update
-        beta_new_a = beta[a] + delta
-        eta_new_a = beta_new_a @ design.T + offset_mat[a]
-        mu_new_a = np.exp(np.clip(eta_new_a, -500, 500))
-        mu_new_a = np.maximum(mu_new_a, 1e-300)
+            # Deviance after trial update
+            ud_new = _unit_nb_deviance(y[a], mu_new_a, disp_mat[a])
+            dev_new = np.sum(w_mat[a] * ud_new, axis=1)
 
-        # Deviance after trial update
-        ud_new = _unit_nb_deviance(y[a], mu_new_a, disp_mat[a])
-        dev_new = np.sum(w_mat[a] * ud_new, axis=1)
+            # Accept/reject per gene (within active set)
+            accept_local = dev_new <= dev_old
+            reject_local = ~accept_local
 
-        # Accept/reject per gene (within active set)
-        accept_local = dev_new <= dev_old
-        reject_local = ~accept_local
+            # Update beta only for accepted genes
+            active_indices = np.where(a)[0]
+            accept_global = active_indices[accept_local]
+            reject_global = active_indices[reject_local]
 
-        # Update beta only for accepted genes
-        active_indices = np.where(a)[0]
-        accept_global = active_indices[accept_local]
-        reject_global = active_indices[reject_local]
+            beta[accept_global] = beta_new_a[accept_local]
 
-        beta[accept_global] = beta_new_a[accept_local]
+            # Update Levenberg damping per gene
+            lev[accept_global] = np.maximum(lev[accept_global] / 10.0, 1e-10)
+            lev[reject_global] = np.minimum(lev[reject_global] * 10.0, 1e10)
 
-        # Update Levenberg damping per gene
-        lev[accept_global] = np.maximum(lev[accept_global] / 10.0, 1e-10)
-        lev[reject_global] = np.minimum(lev[reject_global] * 10.0, 1e10)
-
-        # Check convergence among accepted genes
-        if np.any(accept_local):
-            rel_change = np.abs(dev_old[accept_local] - dev_new[accept_local])
-            threshold = tol * (np.abs(dev_old[accept_local]) + 0.1)
-            converged_local = rel_change < threshold
-            converged_global = accept_global[converged_local]
-            n_iter[converged_global] = it + 1
-            active[converged_global] = False
+            # Check convergence among accepted genes
+            if np.any(accept_local):
+                rel_change = np.abs(dev_old[accept_local] - dev_new[accept_local])
+                threshold = tol * (np.abs(dev_old[accept_local]) + 0.1)
+                converged_local = rel_change < threshold
+                converged_global = accept_global[converged_local]
+                n_iter[converged_global] = it + 1
+                active[converged_global] = False
 
     # Genes that never converged get n_iter = maxit
     n_iter[active] = maxit
