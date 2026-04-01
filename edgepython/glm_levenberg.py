@@ -14,7 +14,8 @@ def mglm_levenberg(y, design, dispersion=0, offset=0, weights=None,
                    coef_start=None, start_method='null', maxit=200, tol=1e-06):
     """Fit genewise negative binomial GLMs using Levenberg damping.
 
-    Port of edgeR's mglmLevenberg.
+    Port of edgeR's mglmLevenberg. Vectorized over all genes simultaneously
+    using batch matrix operations (einsum, batched linalg.solve, active mask).
 
     Parameters
     ----------
@@ -64,7 +65,7 @@ def mglm_levenberg(y, design, dispersion=0, offset=0, weights=None,
             'failed': np.zeros(ngenes, dtype=bool)
         }
 
-    # Expand offset, dispersion, weights
+    # Expand offset, dispersion, weights to full (ngenes, nlibs) matrices
     offset_mat = _expand_compressed(offset, y.shape)
     disp_mat = _expand_compressed(dispersion, y.shape)
     if np.any(np.asarray(disp_mat, dtype=np.float64) < 0):
@@ -82,92 +83,101 @@ def mglm_levenberg(y, design, dispersion=0, offset=0, weights=None,
     else:
         beta = _get_levenberg_start(y, offset_mat, disp_mat, w_mat, design, start_method == 'null')
 
-    # Levenberg-Marquardt iteration for each gene
-    coefficients = np.zeros((ngenes, ncoefs))
-    fitted_values = np.zeros_like(y)
-    deviance = np.zeros(ngenes)
+    # Vectorized Levenberg-Marquardt iteration over all genes
+    beta = beta.copy()
     n_iter = np.zeros(ngenes, dtype=int)
     failed = np.zeros(ngenes, dtype=bool)
+    active = np.ones(ngenes, dtype=bool)
+    lev = np.full(ngenes, 1e-3)
+    coef_idx = np.arange(ncoefs)
 
-    for g in range(ngenes):
-        beta_g = beta[g].copy()
-        y_g = y[g]
-        offset_g = offset_mat[g]
-        disp_g = disp_mat[g] if disp_mat.ndim == 2 else disp_mat
-        w_g = w_mat[g] if w_mat.ndim == 2 else w_mat
+    for it in range(maxit):
+        if not np.any(active):
+            break
+        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+            a = active
+            n_a = np.count_nonzero(a)
 
-        if np.isscalar(disp_g):
-            disp_g = np.full(nlibs, disp_g)
-        if np.isscalar(w_g):
-            w_g = np.full(nlibs, w_g)
+            # Compute mu for active genes: eta = design @ beta + offset
+            # beta[a] is (n_a, ncoefs), design is (nlibs, ncoefs)
+            # eta[g, j] = sum_k(design[j,k] * beta[g,k]) + offset[g,j]
+            eta_a = beta[a] @ design.T + offset_mat[a]
+            mu_a = np.exp(np.clip(eta_a, -500, 500))
+            mu_a = np.maximum(mu_a, 1e-300)
 
-        converged = False
-        lev = 1e-3  # Levenberg damping parameter
-
-        for it in range(maxit):
-            # Compute mu
-            eta = design @ beta_g + offset_g
-            mu = np.exp(np.clip(eta, -500, 500))
-            mu = np.maximum(mu, 1e-300)
-
-            # Working weights
-            denom = 1 + disp_g * mu
-            working_w = w_g * mu ** 2 / (mu * denom)
-            working_w = np.maximum(working_w, 1e-300)
+            # Working weights: w * mu / (1 + disp * mu)
+            denom_a = 1.0 + disp_mat[a] * mu_a
+            working_w_a = w_mat[a] * mu_a / denom_a
+            working_w_a = np.maximum(working_w_a, 1e-300)
 
             # Working residuals
-            z = (y_g - mu) / mu
+            z_a = (y[a] - mu_a) / mu_a
 
-            # Weighted least squares
-            W = np.diag(working_w)
-            XtWX = design.T @ W @ design
-            XtWz = design.T @ (working_w * z)
+            # Batch XtWX: (n_a, ncoefs, ncoefs)
+            # XtWX[g,k,l] = sum_j(design[j,k] * working_w[g,j] * design[j,l])
+            XtWX = np.einsum('gj,jk,jl->gkl', working_w_a, design, design)
 
-            # Add Levenberg damping
-            XtWX_lev = XtWX + lev * np.diag(np.diag(XtWX) + 1e-10)
+            # Batch XtWz: (n_a, ncoefs)
+            # XtWz[g,k] = sum_j(design[j,k] * working_w[g,j] * z[g,j])
+            XtWz = np.einsum('jk,gj->gk', design, working_w_a * z_a)
 
-            try:
-                delta = np.linalg.solve(XtWX_lev, XtWz)
-            except np.linalg.LinAlgError:
-                failed[g] = True
-                break
+            # Add per-gene Levenberg damping to diagonal
+            diag_vals = np.diagonal(XtWX, axis1=1, axis2=2)
+            XtWX_lev = XtWX.copy()
+            XtWX_lev[:, coef_idx, coef_idx] += lev[a, np.newaxis] * (diag_vals + 1e-10)
 
-            # Compute deviance before update
-            dev_old = _unit_deviance_sum(y_g, mu, disp_g, w_g)
+            # Batch solve: (n_a, ncoefs)
+            delta = np.linalg.solve(XtWX_lev, XtWz[..., np.newaxis])[..., 0]
+
+            # Deviance before update (inline, NOT using _unit_deviance_sum)
+            ud_old = _unit_nb_deviance(y[a], mu_a, disp_mat[a])
+            dev_old = np.sum(w_mat[a] * ud_old, axis=1)
 
             # Trial update
-            beta_new = beta_g + delta
-            eta_new = design @ beta_new + offset_g
-            mu_new = np.exp(np.clip(eta_new, -500, 500))
-            mu_new = np.maximum(mu_new, 1e-300)
-            dev_new = _unit_deviance_sum(y_g, mu_new, disp_g, w_g)
+            beta_new_a = beta[a] + delta
+            eta_new_a = beta_new_a @ design.T + offset_mat[a]
+            mu_new_a = np.exp(np.clip(eta_new_a, -500, 500))
+            mu_new_a = np.maximum(mu_new_a, 1e-300)
 
-            if dev_new <= dev_old:
-                # Accept and decrease damping
-                beta_g = beta_new
-                lev = max(lev / 10, 1e-10)
-                if abs(dev_old - dev_new) < tol * (abs(dev_old) + 0.1):
-                    converged = True
-                    n_iter[g] = it + 1
-                    break
-            else:
-                # Reject and increase damping
-                lev = min(lev * 10, 1e10)
+            # Deviance after trial update
+            ud_new = _unit_nb_deviance(y[a], mu_new_a, disp_mat[a])
+            dev_new = np.sum(w_mat[a] * ud_new, axis=1)
 
-        if not converged and not failed[g]:
-            n_iter[g] = maxit
-            # Use last good values
-            eta = design @ beta_g + offset_g
-            mu = np.exp(np.clip(eta, -500, 500))
+            # Accept/reject per gene (within active set)
+            accept_local = dev_new <= dev_old
+            reject_local = ~accept_local
 
-        coefficients[g] = beta_g
-        eta_final = design @ beta_g + offset_g
-        fitted_values[g] = np.exp(np.clip(eta_final, -500, 500))
+            # Update beta only for accepted genes
+            active_indices = np.where(a)[0]
+            accept_global = active_indices[accept_local]
+            reject_global = active_indices[reject_local]
+
+            beta[accept_global] = beta_new_a[accept_local]
+
+            # Update Levenberg damping per gene
+            lev[accept_global] = np.maximum(lev[accept_global] / 10.0, 1e-10)
+            lev[reject_global] = np.minimum(lev[reject_global] * 10.0, 1e10)
+
+            # Check convergence among accepted genes
+            if np.any(accept_local):
+                rel_change = np.abs(dev_old[accept_local] - dev_new[accept_local])
+                threshold = tol * (np.abs(dev_old[accept_local]) + 0.1)
+                converged_local = rel_change < threshold
+                converged_global = accept_global[converged_local]
+                n_iter[converged_global] = it + 1
+                active[converged_global] = False
+
+    # Genes that never converged get n_iter = maxit
+    n_iter[active] = maxit
+
+    # Compute final fitted values for all genes
+    eta_final = beta @ design.T + offset_mat
+    fitted_values = np.exp(np.clip(eta_final, -500, 500))
 
     deviance = nbinom_deviance(y, fitted_values, dispersion, weights)
 
     return {
-        'coefficients': coefficients,
+        'coefficients': beta,
         'fitted.values': fitted_values,
         'deviance': deviance,
         'iter': n_iter,
