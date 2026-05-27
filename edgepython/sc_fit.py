@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import math
 import warnings
-from concurrent.futures import ProcessPoolExecutor
 from math import lgamma as _lgamma
 from typing import Any
 
@@ -619,6 +618,32 @@ def _get_cell_nb(X, fid, nb, k):
     return iscell
 
 # ---------------------------------------------------------------------------
+# Module-level parallel worker
+# ---------------------------------------------------------------------------
+
+# Populated by glm_sc_fit before forking so workers inherit without pickling.
+_PARALLEL_ARGS: dict = {}
+
+
+def _fit_one_worker(idx: int):
+    """Module-level wrapper used by fork-based pool.map."""
+    a = _PARALLEL_ARGS
+    g = a['gid'][idx]
+    counts = a['counts']
+    if hasattr(counts, 'toarray'):
+        y_gene = np.asarray(counts[g, :].toarray()).ravel()
+    else:
+        y_gene = counts[g, :]
+    return _fit_gene_nebula_ln(
+        g, y_gene, a['pred'], a['log_offset'], a['fid'],
+        a['cumsumy'][g, :], a['posind_per_gene'][idx],
+        a['nb'], a['nind'], a['k'], a['sds'], a['int_col'],
+        a['moffset'], a['min_bounds'], a['max_bounds'],
+        a['mfs'], a['cutoff_cell'], a['kappa'],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
 
@@ -1057,9 +1082,13 @@ def glm_sc_fit(y, cell_meta=None, design=None, sample=None,
     if is_anndata:
         adata = y
         X_raw = adata.X
-        if hasattr(X_raw, 'toarray'):
-            X_raw = X_raw.toarray()
-        counts = np.asarray(X_raw, dtype=np.float64).T  # genes × cells
+        # Keep sparse: _call_cumsumy and _fit_one both handle sparse inputs.
+        # csc_matrix.T → CSR (genes × cells), giving O(nnz/gene) row access.
+        import scipy.sparse as _sp
+        if _sp.issparse(X_raw):
+            counts = _sp.csc_matrix(X_raw).T  # CSR: genes × cells
+        else:
+            counts = np.asarray(X_raw, dtype=np.float64).T
         if cell_meta is None:
             cell_meta = adata.obs.copy()
         gene_names = np.array(adata.var_names)
@@ -1071,7 +1100,7 @@ def glm_sc_fit(y, cell_meta=None, design=None, sample=None,
             gene_names = np.asarray(y['genes'])
     else:
         if hasattr(y, 'toarray'):
-            counts = np.asarray(y.toarray(), dtype=np.float64)
+            counts = y  # leave sparse; _fit_one handles toarray per gene
         else:
             counts = np.asarray(y, dtype=np.float64)
 
@@ -1163,7 +1192,7 @@ def glm_sc_fit(y, cell_meta=None, design=None, sample=None,
         log_offset, moffset, cv2 = _cv_offset(offset, nind)
     elif norm_method.upper() == 'TMM':
         # Pseudobulk TMM normalization → per-cell offset
-        lib_size = counts.sum(axis=0).astype(np.float64)
+        lib_size = np.asarray(counts.sum(axis=0)).ravel().astype(np.float64)
         pb = np.zeros((ngene, k), dtype=np.float64)
         for s in range(k):
             start, end = fid[s], fid[s + 1]
@@ -1239,9 +1268,24 @@ def glm_sc_fit(y, cell_meta=None, design=None, sample=None,
         )
 
     if ncore > 1:
-        # Parallel execution
-        with ProcessPoolExecutor(max_workers=ncore) as executor:
-            results = list(executor.map(_fit_one, range(lgid)))
+        # Set module global so forked workers inherit all data without pickling,
+        # then dispatch via the module-level _fit_one_worker (picklable by name).
+        import multiprocessing as _mp
+        import edgepython.sc_fit as _sc_mod
+        _sc_mod._PARALLEL_ARGS = {
+            'counts': counts, 'gid': gid, 'pred': pred,
+            'log_offset': log_offset, 'fid': fid, 'cumsumy': cumsumy,
+            'posind_per_gene': posind_per_gene, 'nb': nb, 'nind': nind,
+            'k': k, 'sds': sds, 'int_col': int_col, 'moffset': moffset,
+            'min_bounds': min_bounds, 'max_bounds': max_bounds,
+            'mfs': mfs, 'cutoff_cell': cutoff_cell, 'kappa': kappa,
+        }
+        try:
+            ctx = _mp.get_context('fork')
+            with ctx.Pool(processes=ncore) as pool:
+                results = pool.map(_fit_one_worker, range(lgid))
+        finally:
+            _sc_mod._PARALLEL_ARGS = {}
     else:
         results = []
         for idx in range(lgid):
